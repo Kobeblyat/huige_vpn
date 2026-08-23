@@ -1,0 +1,134 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:ssrvpn_shared/services/timed_process_runner.dart';
+import 'package:test/test.dart';
+
+void main() {
+  test('cancellation terminates a running process before its timeout',
+      () async {
+    final cancellation = Completer<void>();
+    final watch = Stopwatch()..start();
+    final task = TimedProcessRunner.run(
+      _shellExecutable,
+      _shellArguments(_sleepCommand),
+      timeout: const Duration(seconds: 5),
+      cancellation: cancellation.future,
+    );
+
+    cancellation.complete();
+    final result = await task;
+
+    expect(result.exitCode, 125);
+    expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+  });
+
+  test('cancellation does not return before termination is confirmed',
+      () async {
+    final cancellation = Completer<void>();
+    final terminationStarted = Completer<void>();
+    final mayTerminate = Completer<void>();
+    var returned = false;
+    final task = TimedProcessRunner.run(
+      _shellExecutable,
+      _shellArguments(_sleepCommand),
+      timeout: const Duration(seconds: 5),
+      cancellation: cancellation.future,
+      processTreeTerminator: (process) async {
+        terminationStarted.complete();
+        await mayTerminate.future;
+        process.kill(ProcessSignal.sigkill);
+        await process.exitCode;
+      },
+    )..then<void>((_) => returned = true);
+
+    cancellation.complete();
+    await terminationStarted.future.timeout(const Duration(seconds: 1));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(returned, isFalse);
+
+    mayTerminate.complete();
+    expect((await task).exitCode, 125);
+    expect(returned, isTrue);
+  });
+
+  test('returns timeout result when a process hangs', () async {
+    final result = await TimedProcessRunner.run(
+      _shellExecutable,
+      _shellArguments(_sleepCommand),
+      timeout: const Duration(milliseconds: 20),
+      timeoutStderr: 'timeout',
+    );
+
+    expect(result.exitCode, 124);
+    expect(result.stderr, 'timeout');
+  });
+
+  test(
+    'timeout does not wait for a descendant holding output pipes open',
+    () async {
+      final watch = Stopwatch()..start();
+
+      final result = await TimedProcessRunner.run(
+        '/bin/sh',
+        const ['-c', 'sleep 1 & wait'],
+        timeout: const Duration(milliseconds: 20),
+        timeoutStderr: 'timeout',
+      );
+
+      expect(result.exitCode, 124);
+      expect(result.stderr, 'timeout');
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 750)));
+    },
+    skip: Platform.isWindows ? 'uses POSIX child-process semantics' : false,
+  );
+
+  test(
+    'normal exit does not wait for a descendant holding output pipes open',
+    () async {
+      final watch = Stopwatch()..start();
+
+      final result = await TimedProcessRunner.run(
+        '/bin/sh',
+        const ['-c', 'sleep 2 & exit 0'],
+        timeout: const Duration(seconds: 5),
+      );
+
+      expect(result.exitCode, 0);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 750)));
+    },
+    skip: Platform.isWindows ? 'uses POSIX child-process semantics' : false,
+  );
+
+  test(
+    'caps captured stdout and stderr while continuing to drain the process',
+    () async {
+      final result = await TimedProcessRunner.run(
+        '/bin/sh',
+        const [
+          '-c',
+          r'i=0; while [ "$i" -lt 1024 ]; do '
+              r'printf x; printf y >&2; i=$((i + 1)); done',
+        ],
+        maxCapturedOutputCharacters: 64,
+      );
+
+      expect(result.exitCode, 0);
+      expect(result.stdout, startsWith('x' * 64));
+      expect(result.stderr, startsWith('y' * 64));
+      expect(result.stdout, contains('output truncated'));
+      expect(result.stderr, contains('output truncated'));
+      expect((result.stdout as String).length, lessThan(100));
+      expect((result.stderr as String).length, lessThan(100));
+    },
+    skip: Platform.isWindows ? 'uses a POSIX shell output generator' : false,
+  );
+}
+
+String get _shellExecutable => Platform.isWindows ? 'cmd.exe' : '/bin/sh';
+
+List<String> _shellArguments(String command) =>
+    Platform.isWindows ? ['/c', command] : ['-c', command];
+
+String get _sleepCommand =>
+    Platform.isWindows ? 'ping -n 2 127.0.0.1 > nul' : 'sleep 1';

@@ -1,0 +1,43 @@
+﻿# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IDE
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+
+# Windows build artifacts
+SSRVPN_Windows/build/
+SSRVPN_Windows/SSRVPN_Windows_Release/
+SSRVPN_Windows/SSRVPN_Windows_Release_Build/
+SSRVPN_Windows/windows/flutter/ephemeral/
+SSRVPN_Windows/bin/ssrvpn/
+
+# Backup and temp folders
+ssrvpn_new/
+SSRVPN_Windows_backup*/
+useful/
+
+# Generated zip packages
+*.zip
+*.zip.sha256

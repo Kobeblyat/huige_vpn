@@ -1,0 +1,220 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+typedef ProcessTreeTerminator = Future<void> Function(Process process);
+
+class ProcessTerminationNotConfirmedException implements Exception {
+  ProcessTerminationNotConfirmedException(this.processExit);
+
+  /// Completes only when the original process handle reports termination.
+  final Future<int> processExit;
+
+  @override
+  String toString() => '无法确认已取消的进程已经退出';
+}
+
+class TimedProcessRunner {
+  static const _outputDrainTimeout = Duration(milliseconds: 250);
+  static const int defaultMaxCapturedOutputCharacters = 1024 * 1024;
+
+  static Future<ProcessResult> run(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+    bool includeParentEnvironment = true,
+    Map<String, String>? environment,
+    Duration timeout = const Duration(seconds: 10),
+    int timeoutExitCode = 124,
+    String timeoutStderr = '命令超时',
+    Future<void>? cancellation,
+    int cancellationExitCode = 125,
+    String cancellationStderr = '命令已取消',
+    ProcessTreeTerminator? processTreeTerminator,
+    int maxCapturedOutputCharacters = defaultMaxCapturedOutputCharacters,
+  }) async {
+    if (maxCapturedOutputCharacters <= 0) {
+      throw ArgumentError.value(
+        maxCapturedOutputCharacters,
+        'maxCapturedOutputCharacters',
+        'must be greater than zero',
+      );
+    }
+    Process? process;
+    _OutputCollector? stdoutCollector;
+    _OutputCollector? stderrCollector;
+    Timer? timer;
+    try {
+      process = await Process.start(
+        executable,
+        arguments,
+        workingDirectory: workingDirectory,
+        includeParentEnvironment: includeParentEnvironment,
+        environment: environment,
+      );
+      stdoutCollector = _OutputCollector(
+        process.stdout,
+        maxCapturedOutputCharacters,
+      );
+      stderrCollector = _OutputCollector(
+        process.stderr,
+        maxCapturedOutputCharacters,
+      );
+
+      final completion = Completer<_ProcessCompletion>();
+      process.exitCode.then((exitCode) {
+        if (!completion.isCompleted) {
+          completion.complete(_ProcessCompletion(exitCode, null));
+        }
+      });
+      timer = Timer(timeout, () {
+        if (!completion.isCompleted) {
+          completion.complete(
+            _ProcessCompletion(timeoutExitCode, timeoutStderr),
+          );
+        }
+      });
+      cancellation?.then((_) {
+        if (!completion.isCompleted) {
+          completion.complete(
+            _ProcessCompletion(cancellationExitCode, cancellationStderr),
+          );
+        }
+      });
+
+      final outcome = await completion.future;
+      timer.cancel();
+      final interrupted = outcome.stderrOverride != null;
+      if (interrupted) {
+        await (processTreeTerminator ?? _terminateProcessTree)(process);
+      }
+
+      final outputs = await Future.wait([
+        stdoutCollector.finish(timeout: _outputDrainTimeout),
+        stderrCollector.finish(timeout: _outputDrainTimeout),
+      ]);
+      final stdout = outputs[0];
+      final stderr = outcome.stderrOverride ?? outputs[1];
+      return ProcessResult(process.pid, outcome.exitCode, stdout, stderr);
+    } on ProcessTerminationNotConfirmedException {
+      timer?.cancel();
+      await stdoutCollector?.cancel();
+      await stderrCollector?.cancel();
+      rethrow;
+    } catch (_) {
+      timer?.cancel();
+      if (process != null) {
+        try {
+          await (processTreeTerminator ?? _terminateProcessTree)(process);
+        } on ProcessTerminationNotConfirmedException {
+          await stdoutCollector?.cancel();
+          await stderrCollector?.cancel();
+          rethrow;
+        }
+      }
+      await stdoutCollector?.cancel();
+      await stderrCollector?.cancel();
+      rethrow;
+    }
+  }
+
+  static Future<void> _terminateProcessTree(Process process) async {
+    final processExit = process.exitCode;
+    if (Platform.isWindows) {
+      try {
+        final killer = await Process.start(
+          'taskkill.exe',
+          ['/PID', '${process.pid}', '/T', '/F'],
+        );
+        try {
+          await Future.wait<dynamic>([
+            killer.stdout.drain<void>(),
+            killer.stderr.drain<void>(),
+            killer.exitCode,
+          ]).timeout(const Duration(seconds: 2));
+        } on TimeoutException {
+          killer.kill(ProcessSignal.sigkill);
+        }
+      } catch (_) {
+        // Fall through to the direct-process kill below.
+      }
+    }
+    process.kill(ProcessSignal.sigkill);
+    try {
+      await processExit.timeout(const Duration(seconds: 2));
+    } on TimeoutException {
+      throw ProcessTerminationNotConfirmedException(processExit);
+    }
+  }
+}
+
+class _ProcessCompletion {
+  const _ProcessCompletion(this.exitCode, this.stderrOverride);
+
+  final int exitCode;
+  final String? stderrOverride;
+}
+
+class _OutputCollector {
+  _OutputCollector(Stream<List<int>> stream, this._maxCharacters) {
+    _subscription = stream.transform(utf8.decoder).listen(
+      _capture,
+      onDone: _complete,
+      onError: (Object error, StackTrace stack) {
+        if (!_done.isCompleted) _done.completeError(error, stack);
+      },
+    );
+  }
+
+  final _buffer = StringBuffer();
+  final int _maxCharacters;
+  final _done = Completer<String>();
+  late final StreamSubscription<String> _subscription;
+  int _capturedCharacters = 0;
+  bool _truncated = false;
+
+  void _capture(String chunk) {
+    if (_truncated) return;
+    final remaining = _maxCharacters - _capturedCharacters;
+    if (chunk.length <= remaining) {
+      _buffer.write(chunk);
+      _capturedCharacters += chunk.length;
+      return;
+    }
+
+    var take = remaining;
+    if (take > 0 &&
+        take < chunk.length &&
+        _isHighSurrogate(chunk.codeUnitAt(take - 1))) {
+      take--;
+    }
+    if (take > 0) {
+      _buffer.write(chunk.substring(0, take));
+      _capturedCharacters += take;
+    }
+    _buffer.write('\n...[output truncated]');
+    _truncated = true;
+  }
+
+  bool _isHighSurrogate(int codeUnit) =>
+      codeUnit >= 0xD800 && codeUnit <= 0xDBFF;
+
+  Future<String> finish({Duration? timeout}) async {
+    if (timeout == null) return _done.future;
+    try {
+      return await _done.future.timeout(timeout);
+    } on TimeoutException {
+      await cancel();
+      return _buffer.toString();
+    }
+  }
+
+  Future<void> cancel() async {
+    await _subscription.cancel();
+    _complete();
+  }
+
+  void _complete() {
+    if (!_done.isCompleted) _done.complete(_buffer.toString());
+  }
+}

@@ -1,0 +1,9 @@
+name: huigevpn_workspace
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+
+workspace:
+  - packages/ssrvpn_shared
+  - SSRVPN_Windows

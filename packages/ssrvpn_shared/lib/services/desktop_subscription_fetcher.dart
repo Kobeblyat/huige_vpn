@@ -1,0 +1,301 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import '../constants/app_constants.dart';
+import '../services/direct_fetcher.dart';
+import '../services/subscription_parser.dart';
+import '../services/subscription_refresh_control.dart';
+import '../services/subscription_text_decoder.dart';
+import '../utils/app_logger.dart';
+import '../utils/subscription_url_policy.dart';
+
+class DesktopSubscriptionFetchResult {
+  const DesktopSubscriptionFetchResult({
+    required this.body,
+    required this.headers,
+  });
+
+  final String body;
+  final Map<String, String> headers;
+}
+
+class DesktopSubscriptionFetcher {
+  static const int maxSubscriptionBytes = 20 * 1024 * 1024;
+  static const _maxRedirects = 4;
+  static const _readInactivityTimeout = Duration(seconds: 30);
+  static const _requestTimeout = Duration(seconds: 60);
+
+  static Future<DesktopSubscriptionFetchResult> fetch(
+    String url, {
+    required bool allowDirectFetch,
+    int maxRetries = 3,
+    Duration requestTimeout = _requestTimeout,
+    SubscriptionRefreshControl? control,
+    Future<List<InternetAddress>> Function(String host)? directAddressLookup,
+  }) async {
+    control?.throwIfStopped();
+    final uri = SubscriptionUrlPolicy.parse(url);
+
+    if (_shouldTryDirectFetch(uri, allowDirectFetch: allowDirectFetch)) {
+      try {
+        final directRequestTimeout =
+            control != null && control.remaining < requestTimeout
+                ? control.remaining
+                : requestTimeout;
+        final operation = DirectFetcher.fetchResponse(
+          url,
+          headers: const {
+            'User-Agent': AppConstants.appUserAgent,
+            'Accept': 'text/yaml, application/x-yaml, */*',
+          },
+          maxBodyBytes: maxSubscriptionBytes,
+          requestTimeout: directRequestTimeout,
+          addressLookup: directAddressLookup,
+          cancellation: control?.cancellation,
+        );
+        final response =
+            control == null ? await operation : await control.wait(operation);
+        control?.throwIfStopped();
+        return DesktopSubscriptionFetchResult(
+          body: _normalizeFetchedBody(response.body),
+          headers: response.headers,
+        );
+      } on SubscriptionRefreshCancelled {
+        rethrow;
+      } on SubscriptionRefreshDeadlineExceeded {
+        rethrow;
+      } catch (e) {
+        AppLogger.info('Subscription', '直连通道失败，降级到常规 HTTP: $e');
+      }
+    }
+
+    Exception? lastException;
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      control?.throwIfStopped();
+      try {
+        var current = uri;
+        for (var hop = 0; hop <= _maxRedirects; hop++) {
+          final response = await _fetchOnce(
+            current,
+            attempt: attempt,
+            requestTimeout: requestTimeout,
+            control: control,
+          );
+          if (SubscriptionUrlPolicy.isRedirectStatus(response.statusCode)) {
+            current = SubscriptionUrlPolicy.resolveRedirect(
+              current,
+              response.headers['location'] ?? '',
+            );
+            continue;
+          }
+          if (response.statusCode == 200) {
+            return DesktopSubscriptionFetchResult(
+              body: _normalizeFetchedBody(
+                decodeSubscriptionUtf8(response.bodyBytes),
+              ),
+              headers: {
+                'profile-title': response.headers['profile-title'] ?? '',
+                'content-disposition':
+                    response.headers['content-disposition'] ?? '',
+              },
+            );
+          }
+          if (response.statusCode == 429) {
+            throw Exception('请求过于频繁 (HTTP 429)');
+          }
+          if (response.statusCode == 403) {
+            throw Exception('访问被拒绝 (HTTP 403)');
+          }
+          throw Exception('HTTP ${response.statusCode}');
+        }
+        throw Exception('重定向次数过多');
+      } on SubscriptionRefreshCancelled {
+        rethrow;
+      } on SubscriptionRefreshDeadlineExceeded {
+        rethrow;
+      } on SocketException catch (e) {
+        lastException = Exception('网络连接失败: ${e.message}');
+      } on TimeoutException catch (e) {
+        lastException = Exception('连接超时: ${e.duration}');
+      } on HttpException catch (e) {
+        lastException = Exception('HTTP错误: ${e.message}');
+      } catch (e) {
+        lastException = Exception('获取订阅失败: $e');
+      }
+
+      if (attempt < maxRetries) {
+        final delay = Duration(seconds: attempt * 2);
+        if (control == null) {
+          await Future<void>.delayed(delay);
+        } else {
+          await control.delay(delay);
+        }
+      }
+    }
+
+    throw lastException ?? Exception('获取订阅失败: 未知错误');
+  }
+
+  static Future<_DesktopHttpResponse> _fetchOnce(
+    Uri uri, {
+    required int attempt,
+    required Duration requestTimeout,
+    SubscriptionRefreshControl? control,
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    final client = HttpClient()
+      ..connectionTimeout = Duration(seconds: 15 * attempt);
+    final detachAbort = control?.cancellation.attach(
+      () => client.close(force: true),
+    );
+
+    Duration remaining() {
+      final value = requestTimeout - stopwatch.elapsed;
+      if (value <= Duration.zero) {
+        throw TimeoutException('订阅请求超过绝对时限', requestTimeout);
+      }
+      return value;
+    }
+
+    Future<T> waitFor<T>(Future<T> operation) {
+      if (control == null) return operation;
+      return control.wait(
+        operation,
+        onAbort: () => client.close(force: true),
+      );
+    }
+
+    try {
+      control?.throwIfStopped();
+      final request = await waitFor(client.getUrl(uri).timeout(remaining()));
+      request
+        ..followRedirects = false
+        ..headers.set('User-Agent', AppConstants.appUserAgent)
+        ..headers.set('Accept', 'text/yaml, application/x-yaml, */*');
+
+      final response = await waitFor(request.close().timeout(remaining()));
+      control?.throwIfStopped();
+      final headers = <String, String>{};
+      response.headers.forEach((name, values) {
+        headers[name.toLowerCase()] = values.join(', ');
+      });
+
+      var bodyBytes = Uint8List(0);
+      if (response.statusCode == 200) {
+        if (response.contentLength > maxSubscriptionBytes) {
+          throw Exception('订阅内容超过 20 MB 限制');
+        }
+        bodyBytes = await waitFor(
+          _readLimitedResponse(
+            response.timeout(_readInactivityTimeout),
+            absoluteTimeout: remaining(),
+            requestTimeout: requestTimeout,
+          ),
+        );
+      }
+      return _DesktopHttpResponse(
+        statusCode: response.statusCode,
+        headers: headers,
+        bodyBytes: bodyBytes,
+      );
+    } finally {
+      detachAbort?.call();
+      client.close(force: true);
+    }
+  }
+
+  static bool _shouldTryDirectFetch(
+    Uri uri, {
+    required bool allowDirectFetch,
+  }) {
+    if (!allowDirectFetch) return false;
+    final host = uri.host.trim().toLowerCase();
+    if (host.isEmpty || host == 'localhost') return false;
+    final address = InternetAddress.tryParse(host);
+    if (address == null) return true;
+    if (address.isLoopback || address.isLinkLocal || address.isMulticast) {
+      return false;
+    }
+    final bytes = address.rawAddress;
+    if (address.type == InternetAddressType.IPv4 && bytes.length == 4) {
+      final first = bytes[0];
+      final second = bytes[1];
+      return !(first == 10 ||
+          (first == 172 && second >= 16 && second <= 31) ||
+          (first == 192 && second == 168));
+    }
+    return true;
+  }
+
+  static String _normalizeFetchedBody(String body) {
+    if (body.trim().isEmpty) {
+      throw Exception('服务器返回空内容');
+    }
+    return SubscriptionParser.tryDecodeBase64(body);
+  }
+
+  static Future<Uint8List> _readLimitedResponse(
+    Stream<List<int>> response, {
+    required Duration absoluteTimeout,
+    required Duration requestTimeout,
+  }) async {
+    final builder = BytesBuilder(copy: false);
+    var total = 0;
+    final result = Completer<Uint8List>();
+    late final StreamSubscription<List<int>> subscription;
+
+    void fail(Object error, StackTrace stackTrace) {
+      if (result.isCompleted) return;
+      result.completeError(error, stackTrace);
+      unawaited(subscription.cancel());
+    }
+
+    subscription = response.listen(
+      (chunk) {
+        if (result.isCompleted) return;
+        total += chunk.length;
+        if (total > maxSubscriptionBytes) {
+          fail(
+            Exception('订阅内容超过 20 MB 限制'),
+            StackTrace.current,
+          );
+          return;
+        }
+        builder.add(chunk);
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        fail(error, stackTrace);
+      },
+      onDone: () {
+        if (!result.isCompleted) result.complete(builder.takeBytes());
+      },
+      cancelOnError: true,
+    );
+    final deadline = Timer(absoluteTimeout, () {
+      fail(
+        TimeoutException('订阅请求超过绝对时限', requestTimeout),
+        StackTrace.current,
+      );
+    });
+
+    try {
+      return await result.future;
+    } finally {
+      deadline.cancel();
+      await subscription.cancel();
+    }
+  }
+}
+
+class _DesktopHttpResponse {
+  const _DesktopHttpResponse({
+    required this.statusCode,
+    required this.headers,
+    required this.bodyBytes,
+  });
+
+  final int statusCode;
+  final Map<String, String> headers;
+  final Uint8List bodyBytes;
+}

@@ -1,0 +1,181 @@
+#include <flutter/dart_project.h>
+#include <flutter/flutter_view_controller.h>
+#include <windows.h>
+
+#include "flutter_window.h"
+#include "startup_diagnostics.h"
+#include "system_proxy_recovery.h"
+#include "utils.h"
+
+namespace {
+constexpr wchar_t kAppInstanceMutexName[] =
+    L"Local\\SSRVPN_Windows_SingleInstance";
+constexpr wchar_t kProxyRecoveryMutexName[] =
+    L"Local\\SSRVPN_Windows_ProxyRecovery";
+constexpr DWORD kProxyRecoveryMaxAttempts = 6;
+constexpr DWORD kProxyRecoveryRetryDelayMs = 5000;
+}
+
+int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
+                      _In_ wchar_t *command_line, _In_ int show_command) {
+  startup_diagnostics::Initialize();
+  startup_diagnostics::Log(L"process start");
+  startup_diagnostics::Log(std::wstring(L"command line: ") +
+                           ::GetCommandLineW());
+  startup_diagnostics::Log(std::wstring(L"executable path: ") +
+                           startup_diagnostics::GetExecutablePath());
+
+  std::vector<std::string> command_line_arguments =
+      GetCommandLineArguments();
+  if (command_line_arguments.size() == 1 &&
+      command_line_arguments[0] == "--recover-proxy-only") {
+    HANDLE proxy_recovery_mutex =
+        ::CreateMutexW(nullptr, TRUE, kProxyRecoveryMutexName);
+    const DWORD proxy_recovery_mutex_error = ::GetLastError();
+    if (proxy_recovery_mutex == nullptr) {
+      RearmWindowsProxyRecoveryRunOnce();
+      return EXIT_FAILURE;
+    }
+    if (proxy_recovery_mutex_error == ERROR_ALREADY_EXISTS) {
+      RearmWindowsProxyRecoveryRunOnce();
+      ::CloseHandle(proxy_recovery_mutex);
+      return ERROR_ALREADY_EXISTS;
+    }
+    HANDLE recovery_mutex =
+        ::CreateMutexW(nullptr, TRUE, kAppInstanceMutexName);
+    const DWORD recovery_mutex_error = ::GetLastError();
+    if (recovery_mutex == nullptr) {
+      RearmWindowsProxyRecoveryRunOnce();
+      ::ReleaseMutex(proxy_recovery_mutex);
+      ::CloseHandle(proxy_recovery_mutex);
+      return EXIT_FAILURE;
+    }
+    if (recovery_mutex_error == ERROR_ALREADY_EXISTS) {
+      RearmWindowsProxyRecoveryRunOnce();
+      ::CloseHandle(recovery_mutex);
+      ::ReleaseMutex(proxy_recovery_mutex);
+      ::CloseHandle(proxy_recovery_mutex);
+      return ERROR_ALREADY_EXISTS;
+    }
+
+    bool safe_to_stop = RestoreOrConfirmOwnedWindowsProxySafeToStop();
+    bool retry_logged = false;
+    bool recovery_rearmed = false;
+    for (DWORD attempt = 1;
+         !safe_to_stop && attempt < kProxyRecoveryMaxAttempts; ++attempt) {
+      if (!recovery_rearmed) {
+        recovery_rearmed = RearmWindowsProxyRecoveryRunOnce();
+      }
+      if (!recovery_rearmed && !retry_logged) {
+        startup_diagnostics::Log(
+            L"proxy recovery and RunOnce rearm both failed; retrying");
+        retry_logged = true;
+      }
+      ::Sleep(kProxyRecoveryRetryDelayMs);
+      safe_to_stop = RestoreOrConfirmOwnedWindowsProxySafeToStop();
+    }
+    ::ReleaseMutex(recovery_mutex);
+    ::CloseHandle(recovery_mutex);
+    ::ReleaseMutex(proxy_recovery_mutex);
+    ::CloseHandle(proxy_recovery_mutex);
+    if (!safe_to_stop) {
+      startup_diagnostics::Log(
+          L"proxy recovery retry limit reached; application mutex released");
+      ::MessageBoxW(
+          nullptr,
+          L"SSRVPN 未能自动恢复 Windows 系统代理。恢复任务已停止，不会继续阻止应用启动。请打开 SSRVPN 后重试断开，或检查系统代理设置。",
+          L"SSRVPN 代理恢复未完成",
+          MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    }
+    return safe_to_stop ? EXIT_SUCCESS : ERROR_RETRY;
+  }
+
+  HANDLE instance_mutex =
+      ::CreateMutexW(nullptr, TRUE, kAppInstanceMutexName);
+  const DWORD instance_mutex_error = ::GetLastError();
+  if (instance_mutex == nullptr) {
+    startup_diagnostics::Log(
+        L"instance mutex creation failed: " +
+        std::to_wstring(instance_mutex_error));
+    return static_cast<int>(instance_mutex_error == ERROR_SUCCESS
+                                ? ERROR_OPEN_FAILED
+                                : instance_mutex_error);
+  }
+  bool owns_instance_mutex = instance_mutex_error != ERROR_ALREADY_EXISTS;
+  if (!owns_instance_mutex) {
+    startup_diagnostics::Log(L"existing instance detected");
+    HWND existing_window =
+        ::FindWindowW(L"FLUTTER_RUNNER_WIN32_WINDOW", L"SSRVPN");
+    if (existing_window == nullptr) {
+      existing_window =
+          ::FindWindowW(L"FLUTTER_RUNNER_WIN32_WINDOW", L"ssrvpn_windows");
+    }
+    if (existing_window != nullptr) {
+      if (!::IsHungAppWindow(existing_window)) {
+        ::ShowWindow(existing_window, SW_SHOW);
+        ::ShowWindow(existing_window, SW_RESTORE);
+        ::SetForegroundWindow(existing_window);
+        ::CloseHandle(instance_mutex);
+        return ERROR_ALREADY_EXISTS;
+      }
+      startup_diagnostics::Log(L"existing instance window is hung");
+    } else {
+      startup_diagnostics::Log(L"existing instance window not found");
+    }
+    ::CloseHandle(instance_mutex);
+    return ERROR_BUSY;
+  }
+
+  // Attach to console when present (e.g., 'flutter run') or create a
+  // new console when running with a debugger.
+  if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {
+    CreateAndAttachConsole();
+  }
+
+  // Initialize COM, so that it is available for use in the library and/or
+  // plugins.
+  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+  flutter::DartProject project(L"data");
+
+  project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
+
+  FlutterWindow window(project);
+  Win32Window::Point origin(10, 10);
+  Win32Window::Size size(440, 720);
+  startup_diagnostics::Log(L"window create start");
+  if (!window.Create(L"SSRVPN", origin, size)) {
+    startup_diagnostics::Log(L"window create failed");
+    startup_diagnostics::WriteDesktopFailureLog(L"window create failed");
+    if (owns_instance_mutex) {
+      RestoreOwnedWindowsProxy();
+    }
+    if (instance_mutex != nullptr) {
+      ::CloseHandle(instance_mutex);
+    }
+    return EXIT_FAILURE;
+  }
+  startup_diagnostics::Log(L"window create end");
+  startup_diagnostics::Log(L"window show start");
+  window.Show();
+  startup_diagnostics::Log(L"window show end");
+  window.SetQuitOnClose(true);
+
+  ::MSG msg;
+  while (::GetMessage(&msg, nullptr, 0, 0)) {
+    ::TranslateMessage(&msg);
+    ::DispatchMessage(&msg);
+  }
+  if (owns_instance_mutex) {
+    RestoreOwnedWindowsProxy();
+  }
+  startup_diagnostics::Log(L"message loop ended");
+  window.Destroy();
+  ::CoUninitialize();
+  startup_diagnostics::MarkNormalShutdown();
+  if (instance_mutex != nullptr && owns_instance_mutex) {
+    ::ReleaseMutex(instance_mutex);
+    ::CloseHandle(instance_mutex);
+  }
+  return EXIT_SUCCESS;
+}
