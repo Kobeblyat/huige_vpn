@@ -1,4 +1,4 @@
-﻿# 灰哥VPN (huige_vpn)
+# 灰哥VPN (huige_vpn)
 
 灰哥VPN Windows 官方 PC 客户端，基于 Flutter & Mihomo 内核深度定制开发，提供高速、稳定、安全的用户连接体验。
 
@@ -11,7 +11,7 @@
 
 ## 📥 下载安装
 
-请前往 [Releases 发布页面](https://github.com/Glaroday/huige_vpn/releases) 下载最新版本的客户端安装包或便携绿色压缩包。
+请前往 [Releases 发布页面](https://github.com/Kobeblyat/huige_vpn/releases) 下载最新版本的客户端安装包或便携绿色压缩包。
 
 ## 📄 开源许可
 
