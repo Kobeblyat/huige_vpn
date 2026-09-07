@@ -2,6 +2,8 @@
 
 灰哥VPN Windows 官方 PC 客户端，基于 Flutter & Mihomo 内核深度定制开发，提供高速、稳定、安全的用户连接体验。
 
+当前正式版本：**v4.0.35**。
+
 ## 🌟 功能特性
 
 - **智能分流与节点测速**：支持规则分流、全局模式与直连模式，内置低延迟节点自动测速与选择。
@@ -11,7 +13,7 @@
 
 ## 📥 下载安装
 
-请前往 [Releases 发布页面](https://github.com/Kobeblyat/huige_vpn/releases) 下载最新版本的客户端安装包或便携绿色压缩包。
+请前往 [Releases 发布页面](https://github.com/Kobeblyat/huige_vpn/releases) 下载最新的 `huigeVPN_Setup.exe` 安装包，并可使用同名 `.sha256` 文件核验完整性。
 
 ## 📄 开源许可
 
